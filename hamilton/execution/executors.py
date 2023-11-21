@@ -3,6 +3,7 @@ import dataclasses
 import functools
 import logging
 from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
+import subprocess
 from typing import Any, Callable, Dict, List
 
 from hamilton import node
@@ -115,6 +116,14 @@ def base_execute_task(task: TaskImplementation) -> Dict[str, Any]:
         if key in task.outputs_to_compute or key in task.overrides
     }
     return final_retval
+
+def slurm_execute_task(task: TaskImplementation) -> Dict[str, Any]:
+
+    final_retval = base_execute_task(task)
+    out = {}
+    for name, value in final_retval.items():
+        out[name] = value.submit()
+    return out
 
 
 class SynchronousLocalTaskExecutor(TaskExecutor):
@@ -253,6 +262,116 @@ class MultiProcessingExecutor(PoolExecutor):
 
     def create_pool(self) -> ProcessPoolExecutor:
         return ProcessPoolExecutor(max_workers=self.max_tasks)
+
+class SlurmFeature(TaskFuture):
+    """Wraps a slurm task in a TaskFuture"""
+
+    def __init__(self, job_id, outputs):
+        self.job_id = job_id
+        self.outputs = outputs
+
+    def get_state(self):
+        """Gets the state. This is non-blocking."""
+        job_id = self.job_id
+        process = subprocess.run(["squeue", "-j", job_id, "-h", "-o", "%T"])
+        state = process.stdout.decode("utf-8").strip()
+
+        if state == "R":
+            return TaskState.RUNNING
+        else:
+            for output in self.outputs:
+                if output.exists():
+                    continue
+                else:
+                    return TaskState.FAILED
+            return TaskState.SUCCESSFUL
+
+    def get_result(self):
+        """Gets the result. This is non-blocking.
+
+        :return: None if there is no result, else the result
+        """
+        if not self.get_state() == TaskState.SUCCESSFUL:
+            return None
+        else:
+            return self.outputs
+    
+class SlurmTask:
+
+    def __init__(self, workdir=None):
+        self.wordir = workdir
+        self.configs = {}
+        self.cmd = []
+        self.otuputs = []
+
+    def submit(self):
+        script = ["#!/bin/bash"]
+        for flag, value in self.configs.items():
+            script.append(f"#SBATCH {flag} {value}\n")
+        for cmd in self.cmd:
+            script.append("\n")
+            script.append(cmd)
+
+        with open("slurm.sh", "w") as f:
+            f.write("\n".join(script))
+        process = subprocess.run(["sbatch", "slurm.sh"])
+        slurm_job_id = process.stdout.decode("utf-8").split(" ")[-1].strip()
+        return SlurmFeature(slurm_job_id, self.otuputs)
+
+
+class SlurmExecutor(TaskExecutor):
+
+    def __init__(self, configs: Dict[str, Any]):
+
+        self.configs = configs
+        self.initialized = False
+        self.queue = None
+
+    def init(self):
+        """Initializes the task executor, provisioning any necessary resources."""
+        if not self.initialized:
+            self.queue = self.create_queue()
+            self.initialized = True
+        else:
+            raise RuntimeError("Cannot initialize an already initialized executor")
+
+    def create_queue(self):
+        """Creates a pool to submit tasks to.
+
+        :return: The executor to handle all the tasks in the pool
+        """
+        return list()
+
+    def finalize(self):
+        """Tears down the task executor, freeing up any provisioned resources.
+        Will be called in a finally block."""
+        if self.initialized:
+            self.initialized = False
+        else:
+            raise RuntimeError("Cannot finalize an uninitialized executor")
+
+    def submit_task(self, task: TaskImplementation) -> TaskFuture:
+        """Submits a task to the executor. Returns a task ID that can be used to query the status.
+        Effectively a future.
+
+        :param task: Task implementation (bound with arguments) to submit
+        :return: The future representing the task's computation.
+        """
+        future = slurm_execute_task(task)
+        self.queue.append(future)
+        return TaskFutureWrappingPythonFuture(future)
+        
+    def can_submit_task(self) -> bool:
+        """Returns whether or not we can submit a task to the executor.
+        For instance, if the maximum parallelism is reached, we may not be able to submit a task.
+
+        TODO -- consider if this should be a "parallelism" value instead of a boolean, forcing
+        the ExecutionState to store the state prior to executing a task.
+
+        :return: whether or not we can submit a task.
+        """
+        return True
+
 
 
 class ExecutionManager(abc.ABC):

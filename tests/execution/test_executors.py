@@ -11,6 +11,7 @@ from hamilton.execution.executors import (
     MultiProcessingExecutor,
     MultiThreadingExecutor,
     SynchronousLocalTaskExecutor,
+    SlurmExecutor
 )
 from hamilton.execution.grouping import (
     GroupByRepeatableBlocks,
@@ -24,6 +25,7 @@ from hamilton.htypes import Collect, Parallelizable
 from tests.resources.dynamic_parallelism import (
     inputs_in_collect,
     no_parallel,
+    parallel_slurm,
     parallel_complex,
     parallel_delayed,
     parallel_linear_basic,
@@ -307,3 +309,13 @@ def test_sequential_would_use_too_much_memory_no_garbage_collector(executor_fact
     )
     result = dr.execute(["concatenated"])
     assert result["concatenated"] == NUM_REPS
+
+def test_execute_task_on_slurm():
+
+    dr = (
+        driver.Builder()
+        .with_modules(parallel_slurm)
+        .enable_dynamic_execution(allow_experimental_mode=True)
+        .with_remote_executor(SlurmExecutor({}))
+    ).build()
+    assert dr.execute(["collect_plus_one"])["collect_plus_one"] == 2
